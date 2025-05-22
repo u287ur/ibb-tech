@@ -8,7 +8,7 @@ Bu proje kapsamında şunları bulabilirsiniz:
 
 - **Docker** kullanarak uygulamaların container haline getirilmesi  
 - **Kubernetes** ile bu container'ların yönetimi ve dağıtımı  
-- **CI/CD süreçlerinin** GitHub Actions, Jenkins gibi araçlarla nasıl otomatikleştirileceği  
+- **CI/CD süreçlerinin** GitHub Actions, Jenkins, ArgoCD gibi araçlarla nasıl otomatikleştirileceği  
 - **DevOps kültürü** ve modern yazılım geliştirme yaşam döngüsü (SDLC) içinde yer alan en iyi uygulamalar
 
 ---
@@ -31,4 +31,3 @@ Bu proje kapsamında şunları bulabilirsiniz:
 - Kubernetes ile Orkestrasyon (GKE, EKS)  
 - CI/CD Süreçleri (GitHub Actions, Jenkins, ArgoCD)  
 - Altyapı Yönetimi (Infrastructure as Code)  
-- İzleme, Güncelleme ve Otomasyon
