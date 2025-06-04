@@ -1,0 +1,209 @@
+pipeline {
+  agent any
+
+  environment {
+    db_username = credentials('db_username')
+    db_password = credentials('db_password')
+    secret_key  = credentials('django_secret_key')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        git branch: 'main', credentialsId: 'github-auth', url: 'https://github.com/hakanbayraktar/book.git'
+      }
+    }
+
+    stage('Read .env Files') {
+      steps {
+        script {
+          def backendEnvLines = readFile('backend/.env.backend').split("\n")
+          def frontendEnvLines = readFile('frontend/.env.frontend').split("\n")
+
+          backendEnvLines.each { line ->
+            def (key, value) = line.split('=', 2)
+            if (key == "DB_HOST") {
+              env.DB_HOST = value
+            } else if (key == "CORS_ALLOWED_ORIGINS") {
+              env.CORS_ALLOWED_ORIGINS = value
+            } else if (key == "CSRF_TRUSTED_ORIGINS") {
+              env.CSRF_TRUSTED_ORIGINS = value
+            }
+          }
+
+          frontendEnvLines.each { line ->
+            def (key, value) = line.split('=', 2)
+            if (key == "VITE_API_BASE_URL") {
+              env.BACKEND_ALB = value
+            }
+          }
+        }
+      }
+    }
+
+    stage('Build & Push Backend Image') {
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'dockerhub_username', passwordVariable: 'dockerhub_password')
+        ]) {
+          dir('backend') {
+            sh '''
+              docker logout || true
+              docker login -u "$dockerhub_username" -p "$dockerhub_password"
+
+              docker build \
+                --build-arg SECRET_KEY="$secret_key" \
+                --build-arg DB_NAME=librarydb \
+                --build-arg DB_USER="$db_username" \
+                --build-arg DB_PASSWORD="$db_password" \
+                --build-arg DB_HOST="$DB_HOST" \
+                --build-arg DB_PORT=3306 \
+                -t "$dockerhub_username/backend:build-$BUILD_NUMBER" .
+
+              docker push "$dockerhub_username/backend:build-$BUILD_NUMBER"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Build & Push Frontend Image') {
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'dockerhub_username', passwordVariable: 'dockerhub_password')
+        ]) {
+          dir('frontend') {
+            sh '''
+              docker logout || true
+              docker login -u "$dockerhub_username" -p "$dockerhub_password"
+
+              docker build \
+                --build-arg VITE_API_BASE_URL="$BACKEND_ALB" \
+                -t "$dockerhub_username/frontend:build-$BUILD_NUMBER" .
+
+              docker push "$dockerhub_username/frontend:build-$BUILD_NUMBER"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Update Backend Launch Template & Refresh ASG') {
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'dockerhub_username', passwordVariable: 'dockerhub_password')
+        ]) {
+          sh '''
+            cat > backend_userdata.sh <<EOF
+#!/bin/bash
+set -e
+apt update -y && apt install -y docker.io
+systemctl enable docker && systemctl start docker
+echo "$dockerhub_password" | docker login -u "$dockerhub_username" --password-stdin
+docker run -d \\
+  -e SECRET_KEY="$secret_key" \\
+  -e DB_NAME="librarydb" \\
+  -e DB_USER="$db_username" \\
+  -e DB_PASSWORD="$db_password" \\
+  -e DB_HOST="$DB_HOST" \\
+  -e DB_PORT=3306 \\
+  -p 8000:8000 \\
+  --name backend-container \\
+  "$dockerhub_username/backend:build-$BUILD_NUMBER"
+EOF
+
+            ENCODED_BACKEND=$(base64 backend_userdata.sh | tr -d '\\n')
+
+            echo '{
+              "UserData": "'"$ENCODED_BACKEND"'"
+            }' > backend_launch_data.json
+
+            LATEST_VERSION=$(aws ec2 describe-launch-templates \
+              --launch-template-names backend-template \
+              --query 'LaunchTemplates[0].LatestVersionNumber' --output text)
+
+            aws ec2 create-launch-template-version \
+              --launch-template-name backend-template \
+              --source-version "$LATEST_VERSION" \
+              --version-description "build-$BUILD_NUMBER" \
+              --launch-template-data file://backend_launch_data.json
+
+            NEW_VERSION=$(aws ec2 describe-launch-templates \
+              --launch-template-names backend-template \
+              --query 'LaunchTemplates[0].LatestVersionNumber' \
+              --output text)
+
+            aws autoscaling update-auto-scaling-group \
+              --auto-scaling-group-name backend-asg \
+              --launch-template "LaunchTemplateName=backend-template,Version=$NEW_VERSION"
+
+            aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name backend-asg \
+              --strategy Rolling
+          '''
+        }
+      }
+    }
+
+    stage('Update Frontend Launch Template & Refresh ASG') {
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'dockerhub_username', passwordVariable: 'dockerhub_password')
+        ]) {
+          sh '''
+            cat > frontend_userdata.sh <<EOF
+#!/bin/bash
+set -e
+apt update -y && apt install -y docker.io
+systemctl enable docker && systemctl start docker
+echo "$dockerhub_password" | docker login -u "$dockerhub_username" --password-stdin
+docker run -d \\
+  -p 8080:8080 \\
+  --name frontend-container \\
+  "$dockerhub_username/frontend:build-$BUILD_NUMBER"
+EOF
+
+            ENCODED_FRONTEND=$(base64 frontend_userdata.sh | tr -d '\\n')
+
+            echo '{
+              "UserData": "'"$ENCODED_FRONTEND"'"
+            }' > frontend_launch_data.json
+
+            LATEST_VERSION=$(aws ec2 describe-launch-templates \
+              --launch-template-names frontend-template \
+              --query 'LaunchTemplates[0].LatestVersionNumber' --output text)
+
+            aws ec2 create-launch-template-version \
+              --launch-template-name frontend-template \
+              --source-version "$LATEST_VERSION" \
+              --version-description "build-$BUILD_NUMBER" \
+              --launch-template-data file://frontend_launch_data.json
+
+            NEW_VERSION=$(aws ec2 describe-launch-templates \
+              --launch-template-names frontend-template \
+              --query 'LaunchTemplates[0].LatestVersionNumber' \
+              --output text)
+
+            aws autoscaling update-auto-scaling-group \
+              --auto-scaling-group-name frontend-asg \
+              --launch-template "LaunchTemplateName=frontend-template,Version=$NEW_VERSION"
+
+            aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name frontend-asg \
+              --strategy Rolling
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "✅ Deployment completed successfully with build-$BUILD_NUMBER"
+    }
+    failure {
+      echo "❌ Deployment failed!"
+    }
+  }
+}

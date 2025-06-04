@@ -1,0 +1,146 @@
+pipeline {
+  agent any
+
+  environment {
+    db_username = credentials('db_username')
+    db_password = credentials('db_password')
+    secret_key  = credentials('django_secret_key')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        git branch: 'main', credentialsId: 'github-auth', url: 'https://github.com/hakanbayraktar/book.git'
+      }
+    }
+
+    stage('Build & Push Backend Image') {
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'dockerhub_username', passwordVariable: 'dockerhub_password')
+        ]) {
+          dir('backend') {
+            sh '''
+              docker logout || true
+              docker login -u $dockerhub_username -p $dockerhub_password
+
+              DB_HOST=dummy-host  # Terraform apply henüz yapılmadı, build için dummy geçiyoruz
+
+              docker build --build-arg SECRET_KEY=$secret_key \
+                           --build-arg DB_NAME=librarydb \
+                           --build-arg DB_USER=$db_username \
+                           --build-arg DB_PASSWORD=$db_password \
+                           --build-arg DB_HOST=$DB_HOST \
+                           --build-arg DB_PORT=3306 \
+                           -t $dockerhub_username/backend:build-$BUILD_NUMBER .
+
+              docker push $dockerhub_username/backend:build-$BUILD_NUMBER
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Build & Push Frontend Image') {
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'dockerhub_username', passwordVariable: 'dockerhub_password')
+        ]) {
+          dir('frontend') {
+            sh '''
+              docker logout || true
+              docker login -u $dockerhub_username -p $dockerhub_password
+
+              BACKEND_ALB=http://backend-alb-1591626607.us-east-1.elb.amazonaws.com  # Terraform apply henüz yapılmadı, build için dummy geçiyoruz
+
+              docker build --build-arg VITE_API_BASE_URL=$BACKEND_ALB \
+                           -t $dockerhub_username/frontend:build-$BUILD_NUMBER .
+
+              docker push $dockerhub_username/frontend:build-$BUILD_NUMBER
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Terraform Apply - AWS Infrastructure') {
+      steps {
+        dir('infra/aws-resources') {
+          withCredentials([
+            [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds'],
+            usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'dockerhub_username', passwordVariable: 'dockerhub_password')
+          ]) {
+            sh '''
+              terraform init \
+                -backend-config="bucket=tf-state-hakan" \
+                -backend-config="region=us-east-1" \
+                -backend-config="key=aws-resources/terraform.tfstate" \
+                -backend-config="dynamodb_table=terraform-locks"
+
+              terraform apply -auto-approve \
+                -var="backend_image_tag=build-$BUILD_NUMBER" \
+                -var="frontend_image_tag=build-$BUILD_NUMBER" \
+                -var="dockerhub_username=$dockerhub_username" \
+                -var="dockerhub_password=$dockerhub_password" \
+                -var="region=us-east-1" \
+                -var="db_name=librarydb" \
+                -var="db_username=$db_username" \
+                -var="db_password=$db_password" \
+                -var="secret_key=$secret_key" \
+                -var="key_name=jenkins-key" \
+                -var="ami_id=ami-0d59d17fb3b322d0b"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Export Terraform Outputs to .env') {
+      steps {
+        script {
+          def dbHostRaw = sh(script: "terraform -chdir=infra/aws-resources output -raw rds_endpoint", returnStdout: true).trim()
+          def dbHost = sh(script: "echo ${dbHostRaw} | cut -d':' -f1", returnStdout: true).trim()
+          def backendAlb = sh(script: "terraform -chdir=infra/aws-resources output -raw backend_alb_dns", returnStdout: true).trim()
+          def frontendAlb = sh(script: "terraform -chdir=infra/aws-resources output -raw frontend_alb_dns", returnStdout: true).trim()
+
+          writeFile file: 'backend/.env.backend', text: """\
+DB_HOST=${dbHost}
+ALLOWED_HOSTS=${backendAlb}
+CORS_ALLOWED_ORIGINS=http://${frontendAlb}
+CSRF_TRUSTED_ORIGINS=http://${frontendAlb}
+"""
+
+          writeFile file: 'frontend/.env.frontend', text: "VITE_API_BASE_URL=http://${backendAlb}"
+        }
+      }
+    }
+
+    stage('Push .env Files to GitHub') {
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'github-auth', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PAT')
+        ]) {
+          sh '''
+            git config user.name "$GIT_USER"
+            git config user.email "$GIT_USER@users.noreply.github.com"
+
+            git add backend/.env.backend frontend/.env.frontend || true
+            git commit -m "🔄 Update .env files from Terraform output [build $BUILD_NUMBER]" || echo "No changes."
+            git push https://$GIT_USER:$GIT_PAT@github.com/hakanbayraktar/book.git HEAD:main
+          '''
+        }
+      }
+    }
+
+  }
+
+  post {
+    success {
+      echo "✅ Build and deployment completed successfully."
+    }
+    failure {
+      echo "❌ Build failed. Check logs."
+    }
+  }
+}

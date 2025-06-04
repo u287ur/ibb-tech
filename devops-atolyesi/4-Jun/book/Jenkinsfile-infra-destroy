@@ -1,0 +1,79 @@
+pipeline {
+  agent any
+
+  environment {
+    db_username = credentials('db_username')
+    db_password = credentials('db_password')
+    secret_key  = credentials('django_secret_key')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        git branch: 'main', credentialsId: 'github-auth', url: 'https://github.com/hakanbayraktar/book.git'
+      }
+    }
+
+    stage('Confirm Destroy') {
+      steps {
+        script {
+          def userInput = input(
+            id: 'ConfirmDestroy', message: 'Are you sure you want to permanently destroy all AWS infrastructure?',
+            parameters: [
+              choice(name: 'CONFIRM', choices: ['No', 'Yes'], description: 'Select "Yes" to confirm destruction.')
+            ]
+          )
+          if (userInput != 'Yes') {
+            error("❌ Destroy operation cancelled by user.")
+          }
+        }
+      }
+    }
+
+    stage('Terraform Destroy - AWS Infrastructure') {
+      steps {
+        dir('infra/aws-resources') {
+          withCredentials([
+            [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds'],
+            usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'dockerhub_username', passwordVariable: 'dockerhub_password')
+          ]) {
+            sh '''
+              export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+              export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+
+              terraform init \
+                -backend-config="bucket=tf-state-hakan" \
+                -backend-config="region=us-east-1" \
+                -backend-config="key=aws-resources/terraform.tfstate" \
+                -backend-config="dynamodb_table=terraform-locks"
+
+              terraform destroy -auto-approve \
+                -var="backend_image_tag=build-$BUILD_NUMBER" \
+                -var="frontend_image_tag=build-$BUILD_NUMBER" \
+                -var="dockerhub_username=$dockerhub_username" \
+                -var="dockerhub_password=$dockerhub_password" \
+                -var="region=us-east-1" \
+                -var="db_name=librarydb" \
+                -var="db_username=$db_username" \
+                -var="db_password=$db_password" \
+                -var="secret_key=$secret_key" \
+                -var=key_name=jenkins-key \
+                -var="ami_id=ami-0d59d17fb3b322d0b"
+            '''
+          }
+        }
+      }
+    }
+
+  }
+
+  post {
+    success {
+      echo "✅ All AWS resources successfully destroyed."
+    }
+    failure {
+      echo "❌ Destroy operation FAILED"
+    }
+  }
+}
