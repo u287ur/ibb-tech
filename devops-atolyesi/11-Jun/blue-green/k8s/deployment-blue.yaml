@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: petclinic-blue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: petclinic-blue
+  template:
+    metadata:
+      labels:
+        app: petclinic-blue
+    spec:
+      containers:
+      - name: petclinic
+        image: hbayraktar/petclinic:blue
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SPRING_DATASOURCE_URL
+          value: jdbc:mysql://mysql:3306/petclinic
+        - name: SPRING_DATASOURCE_USERNAME
+          valueFrom:
+            configMapKeyRef:
+              name: mysql-config
+              key: MYSQL_USER
+        - name: SPRING_DATASOURCE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: MYSQL_PASSWORD

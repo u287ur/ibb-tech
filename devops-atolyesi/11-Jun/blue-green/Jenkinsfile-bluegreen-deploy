@@ -1,0 +1,144 @@
+pipeline {
+  agent any
+
+  parameters {
+    choice(name: 'DEPLOY_ENV', choices: ['BLUE', 'GREEN'], description: 'Deploy edilecek ortamı seçin')
+  }
+
+  environment {
+    AWS_REGION = "us-east-1"
+    CLUSTER_NAME = "bluegreen-cluster"
+    IMAGE_TAG = "hbayraktar/petclinic:${params.DEPLOY_ENV.toLowerCase()}"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: 'main', credentialsId: 'github-auth', url: 'https://github.com/hakanbayraktar/blue-green.git'
+      }
+    }
+
+    stage('Customize Homepage') {
+      steps {
+        script {
+          def envUpper = params.DEPLOY_ENV
+          def envLower = envUpper.toLowerCase()
+          sh """
+            sed -i 's/\\[ENV\\]/${envUpper}/g' src/main/resources/templates/welcome.html
+            sed -i 's/\\[COLOR\\]/${envLower}/g' src/main/resources/templates/welcome.html
+          """
+        }
+      }
+    }
+
+    stage('Build with Maven') {
+      steps {
+        sh 'mvn clean package -DskipTests'
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      steps {
+        withCredentials([
+          string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN'),
+          string(credentialsId: 'sonar-url', variable: 'SONAR_URL')
+        ]) {
+          sh """
+            mvn sonar:sonar \
+              -Dsonar.projectKey=petclinic \
+              -Dsonar.projectName="Spring PetClinic" \
+              -Dsonar.sources=src/main/java \
+              -Dsonar.tests=src/test/java \
+              -Dsonar.java.binaries=target/classes \
+              -Dsonar.host.url=$SONAR_URL \
+              -Dsonar.login=$SONAR_TOKEN
+          """
+        }
+      }
+    }
+
+    
+    stage('Trivy Security Scan') {
+      steps {
+        echo "🔒 Running Trivy Security Scan..."
+        sh '''
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image ${IMAGE_TAG} || true
+        '''
+      }
+    }
+    
+
+    stage('Build Docker Image') {
+      steps {
+        sh "docker build -t ${IMAGE_TAG} ."
+      }
+    }
+
+    stage('Push Docker Image') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+          sh """
+            echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+            docker push ${IMAGE_TAG}
+          """
+        }
+      }
+    }
+
+    stage('Deploy to Kubernetes') {
+      steps {
+        withCredentials([[
+          $class: 'AmazonWebServicesCredentialsBinding',
+          credentialsId: 'aws-creds'
+        ]]) {
+          script {
+            def envLower = params.DEPLOY_ENV.toLowerCase()
+            sh """
+              aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+              kubectl apply -f k8s/deployment-${envLower}.yaml
+              kubectl rollout status deployment/petclinic-${envLower} --timeout=180s
+            """
+          }
+        }
+      }
+    }
+
+    stage('Switch Service Selector') {
+      steps {
+        withCredentials([[
+          $class: 'AmazonWebServicesCredentialsBinding',
+          credentialsId: 'aws-creds'
+        ]]) {
+          script {
+            def envLower = params.DEPLOY_ENV.toLowerCase()
+            sh """
+              aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+              kubectl get svc petclinic-service -o yaml > svc.yaml
+              sed -i '/selector:/,/^[^ ]/ s/app: petclinic-.*/app: petclinic-${envLower}/' svc.yaml
+              kubectl apply -f svc.yaml
+              kubectl get svc petclinic-service
+            """
+          }
+        }
+      }
+    }
+/*
+    stage('Clean Up Old Deployment') {
+      steps {
+        withCredentials([[
+          $class: 'AmazonWebServicesCredentialsBinding',
+          credentialsId: 'aws-creds'
+        ]]) {
+          script {
+            def oldEnv = params.DEPLOY_ENV == 'BLUE' ? 'green' : 'blue'
+            sh """
+              aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+              kubectl delete deployment petclinic-${oldEnv} --ignore-not-found=true
+            """
+          }
+        }
+      }
+    }
+    */
+  }
+}

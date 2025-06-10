@@ -1,0 +1,93 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION = "us-east-1"
+    CLUSTER_NAME = "bluegreen-cluster"
+    LB_TAG_KEY = "kubernetes.io/cluster/${CLUSTER_NAME}"
+  }
+
+  stages {
+
+    stage('User Approval') {
+      steps {
+        script {
+          def userInput = input(
+            id: 'ProceedDelete',
+            message: "⚠️ EKS Cluster '${CLUSTER_NAME}' and associated resources will be deleted. Do you want to continue?",
+            parameters: [choice(name: 'Confirm', choices: 'No\nYes', description: 'Select Yes to continue')]
+          )
+          if (userInput != 'Yes') {
+            error('⛔ Deletion process was cancelled by the user.')
+          }
+        }
+      }
+    }
+
+    stage('Delete EKS Cluster') {
+      steps {
+        withCredentials([[
+          $class: 'AmazonWebServicesCredentialsBinding',
+          credentialsId: 'aws-creds'
+        ]]) {
+          sh '''
+            echo "🧨 Deleting EKS Cluster: $CLUSTER_NAME"
+            eksctl delete cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" || {
+              echo "⚠️ Cluster not found or already deleted. Proceeding..."
+            }
+          '''
+        }
+      }
+    }
+
+    stage('Delete Load Balancers') {
+      steps {
+        withCredentials([[
+          $class: 'AmazonWebServicesCredentialsBinding',
+          credentialsId: 'aws-creds'
+        ]]) {
+          sh '''
+            echo "🔍 Deleting Load Balancers (cluster tag: $LB_TAG_KEY)"
+
+            LBS=$(aws elbv2 describe-load-balancers --region "$AWS_REGION" --query "LoadBalancers[*].{Name:LoadBalancerName,Arn:LoadBalancerArn}" --output text)
+
+            if [ -z "$LBS" ]; then
+              echo "ℹ️ No Load Balancers found. Skipping deletion step."
+              exit 0
+            fi
+
+            echo "$LBS" | while read NAME ARN; do
+              if [ -z "$ARN" ]; then
+                echo "⚠️ Skipping entry with empty ARN"
+                continue
+              fi
+
+              TAGS=$(aws elbv2 describe-tags --resource-arns "$ARN" --region "$AWS_REGION")
+
+              echo "$TAGS" | grep -q "$LB_TAG_KEY"
+              if [ $? -eq 0 ]; then
+                echo "🗑️ Deleting Load Balancer: $NAME ($ARN)"
+                aws elbv2 delete-load-balancer --load-balancer-arn "$ARN" --region "$AWS_REGION"
+              else
+                echo "ℹ️ Load Balancer $NAME does not have tag $LB_TAG_KEY — skipping"
+              fi
+            done
+          '''
+        }
+      }
+    }
+
+  }
+
+  post {
+    success {
+      echo '✅ EKS Cluster and associated Load Balancers were deleted successfully.'
+    }
+    aborted {
+      echo '⚠️ Deletion was cancelled by the user.'
+    }
+    failure {
+      echo '❌ An error occurred during the deletion process.'
+    }
+  }
+}

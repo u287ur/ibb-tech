@@ -1,0 +1,110 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_CREDS = credentials('aws-creds')
+    AWS_REGION = "us-east-1"
+    CLUSTER_NAME = "bluegreen-cluster"
+    PATH = "${env.WORKSPACE}/tools:${env.PATH}"
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Create EKS Cluster') {
+      steps {
+        withCredentials([[
+          $class: 'AmazonWebServicesCredentialsBinding',
+          credentialsId: 'aws-creds'
+        ]]) {
+          sh '''
+            if eksctl get cluster --region $AWS_REGION --name $CLUSTER_NAME >/dev/null 2>&1; then
+              echo "✅ EKS cluster already exists."
+            else
+              eksctl create cluster \
+                --name $CLUSTER_NAME \
+                --region $AWS_REGION \
+                --version 1.33 \
+                --nodegroup-name workers \
+                --node-type t3.medium \
+                --nodes 2 \
+                --nodes-min 1 \
+                --nodes-max 3 \
+                --managed \
+                --with-oidc \
+                --alb-ingress-access
+              eksctl utils associate-iam-oidc-provider \
+                --region $AWS_REGION \
+                --cluster $CLUSTER_NAME \
+                --approve
+
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Create IAM Service Account for ALB') {
+      steps {
+        sh '''
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          POLICY_NAME="AWSLoadBalancerControllerIAMPolicy"
+          POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
+
+          if ! aws iam get-policy --policy-arn $POLICY_ARN >/dev/null 2>&1; then
+            aws iam create-policy \
+              --policy-name $POLICY_NAME \
+              --policy-document file://k8s/iam-policy.json
+          fi
+
+          eksctl create iamserviceaccount \
+            --cluster $CLUSTER_NAME \
+            --region $AWS_REGION \
+            --namespace kube-system \
+            --name aws-load-balancer-controller \
+            --attach-policy-arn $POLICY_ARN \
+            --override-existing-serviceaccounts \
+            --approve
+        '''
+      }
+    }
+
+    stage('Install EBS CSI Driver') {
+      steps {
+        sh '''
+          echo "📦 Installing EBS CSI Driver..."
+
+          eksctl create iamserviceaccount \
+            --name ebs-csi-controller-sa \
+            --namespace kube-system \
+            --cluster $CLUSTER_NAME \
+            --region $AWS_REGION \
+            --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+            --approve || true
+
+          eksctl create addon \
+            --name aws-ebs-csi-driver \
+            --cluster $CLUSTER_NAME \
+            --region $AWS_REGION \
+            --force
+        '''
+      }
+    }
+
+    stage('Deploy MySQL StatefulSet') {
+      steps {
+        sh '''
+          aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+          kubectl apply -f k8s/mysql-deploy.yaml
+          kubectl apply -f k8s/petclinic-service.yaml
+          kubectl rollout status statefulset/mysql --timeout=180s
+        '''
+      }
+    }
+  }
+}
